@@ -1,0 +1,19 @@
+{
+  "name": "dsh-team-member-preset",
+  "version": "0.1.0",
+  "description": "Team Lead assigns an agent preset (mode) to any team member session via the team_assign_preset tool; members created without an assignment inherit the Lead's preset.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib/index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-teams",
+    "agent-preset"
+  ]
+}

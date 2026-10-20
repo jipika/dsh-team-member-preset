@@ -1,0 +1,307 @@
+// dsh-team-member-preset — Team 成员模式指派
+//
+// 用途：Team Lead 可以把任意成员会话切换到指定 agent preset（模式）；
+// 成员创建时不指派 = 天然继承 Lead 的模式（宿主默认行为，本插件不改它）。
+//
+// 机制（全部一手核对过源码）：
+//  · ctx.agentTeams.listMembers(agent) → TeamMemberView[]（含 id=SessionId、
+//    name、role、status；experimental/agent-team/src/roster.ts L165-251）。
+//    非成员会话抛 TEAM_NOT_MEMBER（roster.ts L76-82）→ 捕获转友好提示。
+//  · Lead 行固定 { id: root.id, name: 'lead', role: 'lead' }（roster.ts L119-124），
+//    caller 是 lead ⟺ leadRow.id === callerId（agent.session?.id ?? agent.id，
+//    dsh-plan-auto L172 同款防御）。
+//  · 成员 id 就是 SessionId，ctx.agents.get(id) 返回活体 Agent 或 undefined
+//    （core/agent/src/index.ts L564-565）。
+//  · 切换三步照搬 dsh-preset-hotswap（L55-68）：
+//    turnBoundary 守卫（openTurnStartSeq 非 null 拒）→
+//    presets.resolve(presetId)（404 带 available）→
+//    presets.recompose(agent.ctx, id) + agent.session.append("agent-preset/selected")。
+//  · 当前模式读取：sessionProjections.stateOf(session, "agentPreset")（软取，
+//    preset-runtime-read 记忆条目；header 作冷启动兜底）。
+//
+// 权限与幂等：Lead-only；同一成员的连续切换按 sessionId 串行化（hotswap 同款
+// switches Map）；重复指派同一模式 = recompose 幂等重绑（retain 语义，旧
+// generation 按引用数保留）；切换失败不留半状态（recompose 抛错则 append 不执行）。
+// 回滚：把成员切回原 preset id 即可（工具可逆），或禁用本插件（不影响宿主）。
+
+export const name = "dsh-team-member-preset";
+export const inject = ["tools", "agents", "agentTeams", "agentPresets", "sessionProjections", "commands"];
+
+const log = (...a) => console.log("[dsh-team-member-preset]", ...a);
+
+function fail(code, message) {
+	const e = new Error(message);
+	e.code = code;
+	return e;
+}
+
+// ── 命令目录空窗自愈 ─────────────────────────────────────────────
+// 背景：ui-commands 的 directory 对「ready + 空数组」快照没有失效机制——
+// 若 command.list RPC 恰好落在宿主命令注册表未就绪/被重绑的窗口，client
+// 会把空快照永久缓存，斜杠命令菜单从此为空（宿主命令面稳定后没有任何
+// 广播能纠正它）。preset 切换（recompose）正是会制造这种窗口的动作之一。
+//
+// 自愈手段（只用宿主公共 API，不动上游）：ctx.commands.register() 的
+// register/dispose 都会经 ScopedLayers.notifyChange() 广播 'commands/change'
+// （interaction/commands L263-267/L285-293；api/remotes L28 以 emit 模式把
+// 该事件转发全部 client），client 收到后 invalidateAll() → 每个条目后台
+// 重拉（directory.ts L62-64）→ 空快照被真数据覆盖。
+//
+// 判据与动作的时序：先 list 验空 → 确认空后才 register+dispose（自愈动作
+// 在判定之后，不污染判据）；哨兵 register 与 dispose 在同一同步块内，
+// dispose 置于 finally 保证必达；第二针后仍空 → console.warn 留痕（有界：
+// 最多两针，不无限重试）。
+export function apply(ctx) {
+	const switches = new Map(); // sessionId -> Promise，串行化同一成员的连续切换
+
+	let healSeq = 0;
+	/** 注册+注销一个哨兵命令：两次合法的命令注册表变化 → 两次 commands/change 广播。 */
+	function broadcastCommandsChange(tag) {
+		const commands = ctx.commands;
+		if (commands === undefined) return;
+		const name = `team-preset-heal-${tag}-${++healSeq}`;
+		let dispose = undefined;
+		try {
+			dispose = commands.register({
+				name,
+				description: `Internal sentinel to refresh command catalogs (${tag}); disappears immediately.`,
+				handler: async () => ({ kind: "success", text: "heal sentinel" }),
+			});
+		} catch (error) {
+			log("heal broadcast register failed:", error);
+			return;
+		} finally {
+			// dispose 必达：哨兵只在同步间隙存在，异常也不残留全局命令
+			try {
+				dispose?.();
+			} catch (error) {
+				log("heal sentinel dispose failed:", error);
+			}
+		}
+		log(`commands/change heal broadcast sent (${name})`);
+	}
+
+	/** 切换后延迟验证目标会话的命令目录；发现空窗就广播自愈（最多两针，有界）。 */
+	function verifyCommandCatalog(agent, sessionId, label) {
+		const commands = ctx.commands;
+		if (commands === undefined) return;
+		setTimeout(() => {
+			let list;
+			try {
+				// 宿主内直调 CommandRuntime.list 是同步的（@Remote 是类型级标记，
+				// bindTypertRemote 不改写方法体）；thenable 兼容双态防御。
+				list = commands.list(agent);
+				if (list !== null && typeof list === "object" && typeof list.then === "function") {
+					list.then((resolved) => checkEmpty(resolved)).catch((error) => log("catalog verify rejected:", error));
+					return;
+				}
+			} catch (error) {
+				log("catalog verify skipped:", error?.message ?? error);
+				return;
+			}
+			checkEmpty(list);
+		}, 400);
+
+		function checkEmpty(list) {
+			if (!Array.isArray(list) || list.length > 0) return;
+			log(`empty command catalog detected on ${label} (${sessionId}) — broadcasting heal`);
+			broadcastCommandsChange(label);
+			// 广播到 client 重拉有往返延迟；1.5s 后复验一次，仍空再补一针并留痕
+			setTimeout(() => {
+				try {
+					const again = commands.list(agent);
+					if (Array.isArray(again) && again.length === 0) {
+						broadcastCommandsChange(`${label}-retry`);
+						setTimeout(() => {
+							try {
+								const final = commands.list(agent);
+								if (Array.isArray(final) && final.length === 0) {
+									console.warn(`[dsh-team-member-preset] command catalog of "${label}" (${sessionId}) still empty after 2 heal rounds — manual refresh (switch mode once / Cmd+R) required`);
+								}
+							} catch { /* 会话可能已下线 */ }
+						}, 1500);
+					}
+				} catch { /* 会话可能已下线 */ }
+			}, 1500);
+		}
+	}
+
+	function currentPresetOf(agent) {
+		const proj = ctx.sessionProjections;
+		if (proj !== undefined && typeof proj.stateOf === "function") {
+			const value = proj.stateOf(agent.session, "agentPreset");
+			return value ?? null;
+		}
+		return agent.session?.header?.agentPreset ?? null;
+	}
+
+	async function availablePresets() {
+		try {
+			const roster = await ctx.agentPresets.remoteExportList();
+			return (roster?.presets ?? []).map((p) => p.id ?? p).filter((v) => typeof v === "string");
+		} catch {
+			return [];
+		}
+	}
+
+	async function assignPreset(callerAgent, targetName, presetId) {
+		const teams = ctx.agentTeams;
+		const presets = ctx.agentPresets;
+		const agents = ctx.agents;
+		if (teams === undefined || presets === undefined || agents === undefined) {
+			throw fail("unavailable", "required services (agentTeams / agentPresets / agents) are absent");
+		}
+
+		// 1. 花名册；非 Team 会话的 agent 会抛 TEAM_NOT_MEMBER → 转友好提示
+		let rows;
+		try {
+			rows = teams.listMembers(callerAgent);
+		} catch (error) {
+			const code = String(error?.code ?? "");
+			const msg = String(error?.message ?? error);
+			if (code.includes("NOT_MEMBER") || /not a member/i.test(msg)) {
+				throw fail(
+					"not-a-team",
+					"当前会话不属于任何 Agent Team —— 先用 spawn_teammate 开团，再使用本工具",
+				);
+			}
+			throw error;
+		}
+
+		// 2. Lead-only：Lead 行 id 必须等于 caller 的 sessionId
+		const callerId = callerAgent.session?.id ?? callerAgent.id;
+		const leadRow = rows.find((r) => r.role === "lead");
+		if (leadRow === undefined || leadRow.id !== callerId) {
+			throw fail("lead-only", "只有 Team Lead 可以指派成员模式（assign preset）");
+		}
+
+		// 3. 解析 target："lead" 或成员名
+		const wanted = String(targetName ?? "").trim();
+		const targetRow =
+			wanted === "lead"
+				? leadRow
+				: rows.find((r) => r.role === "teammate" && r.name === wanted);
+		if (targetRow === undefined) {
+			const names = rows.map((r) => (r.role === "lead" ? "lead" : r.name)).join(", ");
+			throw fail("target-not-found", `找不到成员 "${targetName}"（可用: ${names}）`);
+		}
+
+		// 4. 目标会话活体（inactive ≠ 在线；continuable child 可能已卸载）
+		const targetAgent = agents.get(targetRow.id);
+		if (targetAgent === undefined) {
+			throw fail(
+				"not-live",
+				`成员 "${targetRow.name}" 的会话当前不在线（status=${targetRow.status}）。先用 send_message 唤醒它，再切模式`,
+			);
+		}
+
+		// 5. 只读：省略 preset → 报告当前模式 + 可用列表
+		if (presetId === undefined || presetId === null || String(presetId).trim() === "") {
+			const current = currentPresetOf(targetAgent);
+			const available = await availablePresets();
+			return {
+				target: targetRow.name,
+				changed: false,
+				preset: current,
+				status: targetRow.status,
+				available,
+				text: `成员 "${targetRow.name}" 当前模式: ${current ?? "（无，未挂任何 preset）"}。可用模式: ${available.join(", ") || "（未知）"}。要指派请带 preset 参数。`,
+			};
+		}
+
+		// 6. 切换：串行 → turnBoundary 守卫 → resolve → recompose → append
+		const wantedPreset = String(presetId).trim();
+		const before = currentPresetOf(targetAgent);
+		const prev = switches.get(targetRow.id) ?? Promise.resolve();
+		const turn = prev.then(async () => {
+			const boundary = ctx.sessionProjections?.stateOf?.(targetAgent.session, "turnBoundary");
+			if (
+				boundary !== undefined && boundary !== null &&
+				boundary.openTurnStartSeq !== null && boundary.openTurnStartSeq !== undefined
+			) {
+				throw fail("turn/open", `成员 "${targetRow.name}" 有轮次正在进行；等它空闲后再切模式`);
+			}
+			try {
+				await presets.resolve(wantedPreset);
+			} catch (error) {
+				const avail = error?.details?.available;
+				throw fail(
+					"agent-preset/not-found",
+					`未知模式: ${wantedPreset}${Array.isArray(avail) ? `（可用: ${avail.join(", ")}）` : ""}`,
+				);
+			}
+			const preset = await presets.recompose(targetAgent.ctx, wantedPreset);
+			targetAgent.session.append("agent-preset/selected", { agentPreset: preset.id });
+			return preset.id;
+		});
+		switches.set(targetRow.id, turn.catch(() => {}));
+		const newPreset = await turn;
+		// 切换后验证目标成员的命令目录，空窗即广播自愈（见文件头注释）
+		verifyCommandCatalog(targetAgent, targetRow.id, targetRow.name);
+		log(`member "${targetRow.name}" (${targetRow.id}) preset: ${String(before)} -> ${newPreset}`);
+		return {
+			target: targetRow.name,
+			changed: true,
+			preset: newPreset,
+			previous: before,
+			text: `已把成员 "${targetRow.name}" 从 ${String(before ?? "（无）")} 切到 ${newPreset}。它下一轮请求即用新模式（工具目录 / 技能 / 系统提示词段随之更新）。`,
+		};
+	}
+
+	ctx.tools.register({
+		name: "team_assign_preset",
+		description:
+			"Assign an agent preset (mode) to one Agent Team member session. Team Lead only. " +
+			"Members created without an assignment inherit the Lead's preset automatically — use this tool to override per member. " +
+			"Omit `preset` to read the member's current mode and the available list. " +
+			"The target member must be idle (no running turn) and its session must be live; wake it with send_message first if needed. " +
+			"The change takes effect on the member's next request (tools, skills and system-prompt sections rebind). " +
+			"Not for: sessions outside an Agent Team (it refuses), or switching your own session — use the UI preset switcher for that.",
+		parameters: {
+			type: "object",
+			properties: {
+				target: {
+					type: "string",
+					description: 'Member name as returned by list_agents (its target), or "lead".',
+				},
+				preset: {
+					type: "string",
+					description:
+						"Preset id to assign (e.g. video / standard / writing — see the available list). Omit to read the current mode only.",
+				},
+			},
+			required: ["target"],
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					text: { type: "string" },
+					changed: { type: "boolean" },
+					target: { type: "string" },
+					preset: { oneOf: [{ type: "string" }, { type: "null" }] },
+				},
+				required: ["text", "changed", "target"],
+			},
+			render: (_args, value) => [{ type: "text", text: value.text }],
+		},
+		async execute(args, exec) {
+			const agent = exec === null || typeof exec !== "object" ? undefined : exec.agent;
+			if (agent === undefined || agent === null) {
+				throw fail("no-agent", "tool run context has no live agent");
+			}
+			try {
+				const result = await assignPreset(agent, args.target, args.preset);
+				return { text: result.text, changed: result.changed, target: result.target, preset: result.preset ?? null };
+			} catch (error) {
+				if (error !== null && typeof error === "object" && typeof error.code === "string") throw error;
+				log("assign failed:", error);
+				throw fail("assign-failed", String(error?.message ?? error));
+			}
+		},
+	});
+
+	log("team_assign_preset registered (Host layer, all presets)");
+}
